@@ -4,9 +4,34 @@
 #include <string.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <sys/syscall.h>
+
+// Kunci bersama untuk verifikasi respon server
+static const char* AUTH_SECRET_KEY = "CbtAuthSecKey_2026_x9F";
 
 static int g_derived_key = -1;
 
+// === 1. DIRECT SYSCALL KILL (Kebal Hooking Libc) ===
+static void silent_die() {
+#if defined(__aarch64__)
+    register long x8 __asm__("x8") = 129; // __NR_kill pada ARM64
+    register long x0 __asm__("x0") = getpid();
+    register long x1 __asm__("x1") = SIGKILL;
+    __asm__ volatile("svc #0" : "=r"(x0) : "r"(x8), "r"(x0), "r"(x1) : "memory");
+#elif defined(__arm__)
+    register long r7 __asm__("r7") = 37;  // __NR_kill pada ARMv7
+    register long r0 __asm__("r0") = getpid();
+    register long r1 __asm__("r1") = SIGKILL;
+    __asm__ volatile("svc #0" : "=r"(r0) : "r"(r7), "r"(r0), "r"(r1) : "memory");
+#else
+    kill(getpid(), SIGKILL);
+#endif
+    _exit(0);
+}
+
+// === 2. ANTI-DEBUG KERNEL TRACER CHECK ===
 static void check_tracer() {
     int fd = open("/proc/self/status", O_RDONLY);
     if (fd < 0) return;
@@ -21,28 +46,26 @@ static void check_tracer() {
         if (tracer) {
             int pid = atoi(tracer + 10);
             if (pid != 0) {
-                kill(getpid(), SIGKILL);
-                exit(0);
+                silent_die();
             }
         }
     }
 }
 
-// Menghitung kunci XOR langsung dari byte pertama SHA-256 sertifikat penandatangan runtime
+// === 3. DYNAMIC KEY DERIVATION DARI SIGNATURE APK ===
 static unsigned char get_dynamic_key(JNIEnv* env) {
     if (g_derived_key != -1) {
         return (unsigned char)g_derived_key;
     }
 
-    // Ambil Context via ActivityThread.currentApplication()
     jclass actThreadCls = env->FindClass("android/app/ActivityThread");
-    if (!actThreadCls) { g_derived_key = 0x00; return 0x00; }
+    if (!actThreadCls) { g_derived_key = 0x5A; return 0x5A; }
 
     jmethodID currentAppMethod = env->GetStaticMethodID(actThreadCls, "currentApplication", "()Landroid/app/Application;");
-    if (!currentAppMethod) { g_derived_key = 0x00; return 0x00; }
+    if (!currentAppMethod) { g_derived_key = 0x5A; return 0x5A; }
 
     jobject context = env->CallStaticObjectMethod(actThreadCls, currentAppMethod);
-    if (!context) { g_derived_key = 0x00; return 0x00; }
+    if (!context) { g_derived_key = 0x5A; return 0x5A; }
 
     jclass ctxCls = env->GetObjectClass(context);
     jmethodID getPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
@@ -54,12 +77,10 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getPkgInfo = env->GetMethodID(pmCls, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
 
-    // 0x08000000 = GET_SIGNING_CERTIFICATES (Android 9+)
     jobject pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x08000000);
     if (!pkgInfo) {
-        // Fallback GET_SIGNATURES (0x00000040)
         pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040);
-        if (!pkgInfo) { g_derived_key = 0x00; return 0x00; }
+        if (!pkgInfo) { g_derived_key = 0x5A; return 0x5A; }
     }
 
     jclass piCls = env->GetObjectClass(pkgInfo);
@@ -94,9 +115,8 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
         }
     }
 
-    if (!certBytes) { g_derived_key = 0x00; return 0x00; }
+    if (!certBytes) { g_derived_key = 0x5A; return 0x5A; }
 
-    // Hitung SHA-256 dari sertifikat penandatangan
     jclass mdCls = env->FindClass("java/security/MessageDigest");
     jmethodID getInst = env->GetStaticMethodID(mdCls, "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
     jstring shaStr = env->NewStringUTF("SHA-256");
@@ -104,10 +124,9 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
 
     jmethodID digestMethod = env->GetMethodID(mdCls, "digest", "([B)[B");
     jbyteArray digestBytes = (jbyteArray)env->CallObjectMethod(md, digestMethod, certBytes);
-    if (!digestBytes) { g_derived_key = 0x00; return 0x00; }
+    if (!digestBytes) { g_derived_key = 0x5A; return 0x5A; }
 
     jbyte* pBytes = env->GetByteArrayElements(digestBytes, nullptr);
-    // Kunci diturunkan langsung dari byte pertama hash SHA-256
     unsigned char finalKey = (unsigned char)pBytes[0];
     if (finalKey == 0) finalKey = 0x5A;
     env->ReleaseByteArrayElements(digestBytes, pBytes, JNI_ABORT);
@@ -116,6 +135,7 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
     return finalKey;
 }
 
+// === 4. HELPER BASE64 ===
 static int b64_char_val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -143,11 +163,8 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
+// === 5. JNI EXPORTS ===
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    JNIEnv* env = nullptr;
-    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK) {
-        return JNI_ERR;
-    }
     check_tracer();
     return JNI_VERSION_1_6;
 }
@@ -155,7 +172,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 extern "C" JNIEXPORT jstring JNICALL
 Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input) {
     if (!input) return nullptr;
-
     check_tracer();
 
     const char* str = env->GetStringUTFChars(input, nullptr);
@@ -177,9 +193,69 @@ Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input)
     decoded[decoded_len] = '\0';
 
     jstring result = env->NewStringUTF((char*)decoded);
-
     free(decoded);
     env->ReleaseStringUTFChars(input, str);
-
     return result;
+}
+
+// Validasi Token Server menggunakan Mac JNI
+extern "C" JNIEXPORT jboolean JNICALL
+Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, jstring token, jlong ts) {
+    check_tracer();
+
+    if (!hwid || !token) {
+        silent_die();
+        return JNI_FALSE;
+    }
+
+    const char* cHwid = env->GetStringUTFChars(hwid, nullptr);
+    const char* cToken = env->GetStringUTFChars(token, nullptr);
+
+    // Siapkan payload: "hwid:ts"
+    char payload[256];
+    snprintf(payload, sizeof(payload), "%s:%lld", cHwid, (long long)ts);
+
+    // Hitung HMAC-SHA256 via Java Mac class
+    jclass macCls = env->FindClass("javax/crypto/Mac");
+    jmethodID getMacInst = env->GetStaticMethodID(macCls, "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;");
+    jstring algoStr = env->NewStringUTF("HmacSHA256");
+    jobject mac = env->CallStaticObjectMethod(macCls, getMacInst, algoStr);
+
+    jclass keySpecCls = env->FindClass("javax/crypto/spec/SecretKeySpec");
+    jmethodID keySpecInit = env->GetMethodID(keySpecCls, "<init>", "([BLjava/lang/String;)V");
+
+    jbyteArray keyBytes = env->NewByteArray(strlen(AUTH_SECRET_KEY));
+    env->SetByteArrayRegion(keyBytes, 0, strlen(AUTH_SECRET_KEY), (const jbyte*)AUTH_SECRET_KEY);
+    jobject secretKey = env->NewObject(keySpecCls, keySpecInit, keyBytes, algoStr);
+
+    jmethodID macInit = env->GetMethodID(macCls, "init", "(Ljava/security/Key;)V");
+    env->CallVoidMethod(mac, macInit, secretKey);
+
+    jbyteArray payloadBytes = env->NewByteArray(strlen(payload));
+    env->SetByteArrayRegion(payloadBytes, 0, strlen(payload), (const jbyte*)payload);
+
+    jmethodID doFinalMethod = env->GetMethodID(macCls, "doFinal", "([B)[B");
+    jbyteArray hmacBytes = (jbyteArray)env->CallObjectMethod(mac, doFinalMethod, payloadBytes);
+
+    jsize hmacLen = env->GetArrayLength(hmacBytes);
+    jbyte* pBytes = env->GetByteArrayElements(hmacBytes, nullptr);
+
+    char expectedHex[65];
+    for (int i = 0; i < hmacLen && i < 32; i++) {
+        sprintf(expectedHex + (i * 2), "%02x", (unsigned char)pBytes[i]);
+    }
+    expectedHex[64] = '\0';
+    env->ReleaseByteArrayElements(hmacBytes, pBytes, JNI_ABORT);
+
+    bool isValid = (strcasecmp(cToken, expectedHex) == 0);
+
+    env->ReleaseStringUTFChars(hwid, cHwid);
+    env->ReleaseStringUTFChars(token, cToken);
+
+    if (!isValid) {
+        silent_die(); // Respon dipalsukan atau di-mock -> matikan proses langsung
+        return JNI_FALSE;
+    }
+
+    return JNI_TRUE;
 }
