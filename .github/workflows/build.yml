@@ -1,0 +1,36 @@
+name: Build Native Libs
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Setup Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: r25c
+
+    - name: Compile with ndk-build
+      run: |
+        ndk-build -C jni
+
+    - name: Package Artifacts
+      run: |
+        mkdir -p output
+        cp -r libs/* output/
+        cd output && zip -r ../libhardening-all.zip .
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: libhardening-all
+        path: output/
+        
