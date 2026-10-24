@@ -11,7 +11,7 @@ static const unsigned char XOR_KEY = 0x5A;
 
 // MASUKKAN HASH SHA-256 DARI KEYSTORE pipeline.jks KAMU (HURUF KECIL, TANPA TITIK DUA)
 // Nilai ini bisa diambil dari file keystore/sig.txt
-static const char* EXPECTED_SIGNATURE_SHA256 = "isi_sha256_dari_sig_txt_di_sini";
+static const char* EXPECTED_SIGNATURE_SHA256 = "a3a440f27e56f99077d23747f6ab55e9496bf17e997bdbec74fa0fd9edcd931b";
 
 static void silent_die() {
     kill(getpid(), SIGKILL);
