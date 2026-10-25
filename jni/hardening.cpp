@@ -13,23 +13,38 @@ static const char* AUTH_SECRET_KEY = "CbtAuthSecKey_2026_x9F";
 
 static int g_derived_key = -1;
 
-// === 1. DIRECT SYSCALL KILL (Kebal Hooking Libc) ===
+// === 1. DIRECT SYSCALL KILL (Aman untuk ARM64 & ARMv7 Thumb) ===
 static void silent_die() {
 #if defined(__aarch64__)
-    register long x8 __asm__("x8") = 129; // __NR_kill pada ARM64
+    // ARM64: x8 = __NR_kill (129)
+    register long x8 __asm__("x8") = 129;
     register long x0 __asm__("x0") = getpid();
     register long x1 __asm__("x1") = SIGKILL;
-    __asm__ volatile("svc #0" : "=r"(x0) : "r"(x8), "r"(x0), "r"(x1) : "memory");
+    __asm__ volatile(
+        "svc #0\n"
+        : "=r"(x0)
+        : "r"(x8), "r"(x0), "r"(x1)
+        : "memory"
+    );
 #elif defined(__arm__)
-    register long r7 __asm__("r7") = 37;  // __NR_kill pada ARMv7
+    // ARMv7 (32-bit): Simpan & pulihkan r7 agar Clang tidak melempar error reserved register
     register long r0 __asm__("r0") = getpid();
     register long r1 __asm__("r1") = SIGKILL;
-    __asm__ volatile("svc #0" : "=r"(r0) : "r"(r7), "r"(r0), "r"(r1) : "memory");
+    __asm__ volatile(
+        "push {r7}\n"         // Simpan frame pointer asli ke stack
+        "mov r7, #37\n"       // 37 = __NR_kill pada Linux ARM 32-bit
+        "svc #0\n"            // Panggil interrupt kernel
+        "pop {r7}\n"          // Kembalikan frame pointer asli
+        : "=r"(r0)
+        : "r"(r0), "r"(r1)
+        : "r7", "memory"
+    );
 #else
     kill(getpid(), SIGKILL);
 #endif
     _exit(0);
 }
+
 
 // === 2. ANTI-DEBUG KERNEL TRACER CHECK ===
 static void check_tracer() {
