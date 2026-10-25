@@ -8,16 +8,13 @@
 #include <stdint.h>
 #include <sys/syscall.h>
 
-// Kunci bersama untuk verifikasi respon server
 static const char* AUTH_SECRET_KEY = "CbtAuthSecKey_2026_x9F";
-
 static int g_derived_key = -1;
 
-// === 1. DIRECT SYSCALL KILL (Aman untuk ARM64 & ARMv7 Thumb) ===
+// 1. Direct Syscall Kill (Aman untuk ARM64 & ARMv7 Thumb)
 static void silent_die() {
 #if defined(__aarch64__)
-    // ARM64: x8 = __NR_kill (129)
-    register long x8 __asm__("x8") = 129;
+    register long x8 __asm__("x8") = 129; // __NR_kill ARM64
     register long x0 __asm__("x0") = getpid();
     register long x1 __asm__("x1") = SIGKILL;
     __asm__ volatile(
@@ -27,14 +24,14 @@ static void silent_die() {
         : "memory"
     );
 #elif defined(__arm__)
-    // ARMv7 (32-bit): Simpan & pulihkan r7 agar Clang tidak melempar error reserved register
+    // Simpan r7 agar Clang tidak melempar error reserved register
     register long r0 __asm__("r0") = getpid();
     register long r1 __asm__("r1") = SIGKILL;
     __asm__ volatile(
-        "push {r7}\n"         // Simpan frame pointer asli ke stack
-        "mov r7, #37\n"       // 37 = __NR_kill pada Linux ARM 32-bit
-        "svc #0\n"            // Panggil interrupt kernel
-        "pop {r7}\n"          // Kembalikan frame pointer asli
+        "push {r7}\n"
+        "mov r7, #37\n"       // 37 = __NR_kill Linux ARM 32-bit
+        "svc #0\n"
+        "pop {r7}\n"
         : "=r"(r0)
         : "r"(r0), "r"(r1)
         : "r7", "memory"
@@ -45,8 +42,7 @@ static void silent_die() {
     _exit(0);
 }
 
-
-// === 2. ANTI-DEBUG KERNEL TRACER CHECK ===
+// 2. Anti-Debug TracerPid
 static void check_tracer() {
     int fd = open("/proc/self/status", O_RDONLY);
     if (fd < 0) return;
@@ -67,7 +63,7 @@ static void check_tracer() {
     }
 }
 
-// === 3. DYNAMIC KEY DERIVATION DARI SIGNATURE APK ===
+// 3. Dynamic Key dari Signature
 static unsigned char get_dynamic_key(JNIEnv* env) {
     if (g_derived_key != -1) {
         return (unsigned char)g_derived_key;
@@ -150,7 +146,6 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
     return finalKey;
 }
 
-// === 4. HELPER BASE64 ===
 static int b64_char_val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
@@ -178,7 +173,6 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
-// === 5. JNI EXPORTS ===
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     check_tracer();
     return JNI_VERSION_1_6;
@@ -213,7 +207,6 @@ Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input)
     return result;
 }
 
-// Validasi Token Server menggunakan Mac JNI
 extern "C" JNIEXPORT jboolean JNICALL
 Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, jstring token, jlong ts) {
     check_tracer();
@@ -226,11 +219,9 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
     const char* cHwid = env->GetStringUTFChars(hwid, nullptr);
     const char* cToken = env->GetStringUTFChars(token, nullptr);
 
-    // Siapkan payload: "hwid:ts"
     char payload[256];
     snprintf(payload, sizeof(payload), "%s:%lld", cHwid, (long long)ts);
 
-    // Hitung HMAC-SHA256 via Java Mac class
     jclass macCls = env->FindClass("javax/crypto/Mac");
     jmethodID getMacInst = env->GetStaticMethodID(macCls, "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;");
     jstring algoStr = env->NewStringUTF("HmacSHA256");
@@ -268,7 +259,7 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
     env->ReleaseStringUTFChars(token, cToken);
 
     if (!isValid) {
-        silent_die(); // Respon dipalsukan atau di-mock -> matikan proses langsung
+        silent_die();
         return JNI_FALSE;
     }
 
