@@ -8,7 +8,8 @@
 #include <stdint.h>
 #include <sys/syscall.h>
 
-static const char* AUTH_SECRET_KEY = "CbtAuthSecKey_2026_x9F";
+// Kunci sinkron dengan backend Node.js
+static const char* AUTH_SECRET_KEY = "Sann_026_x9F";
 static int g_derived_key = -1;
 
 // 1. Direct Syscall Kill (Aman untuk ARM64 & ARMv7 Thumb)
@@ -24,14 +25,13 @@ static void silent_die() {
         : "memory"
     );
 #elif defined(__arm__)
-    // Simpan r7 agar Clang tidak melempar error reserved register
     register long r0 __asm__("r0") = getpid();
     register long r1 __asm__("r1") = SIGKILL;
     __asm__ volatile(
-        "push {r7}\n"
+        "push {r7}\n"         // Simpan frame pointer r7
         "mov r7, #37\n"       // 37 = __NR_kill Linux ARM 32-bit
         "svc #0\n"
-        "pop {r7}\n"
+        "pop {r7}\n"          // Kembalikan r7
         : "=r"(r0)
         : "r"(r0), "r"(r1)
         : "r7", "memory"
@@ -42,7 +42,7 @@ static void silent_die() {
     _exit(0);
 }
 
-// 2. Anti-Debug TracerPid
+// 2. Anti-Debug Tracer Check
 static void check_tracer() {
     int fd = open("/proc/self/status", O_RDONLY);
     if (fd < 0) return;
@@ -63,7 +63,7 @@ static void check_tracer() {
     }
 }
 
-// 3. Dynamic Key dari Signature
+// 3. Dynamic Key dari Signature APK Runtime
 static unsigned char get_dynamic_key(JNIEnv* env) {
     if (g_derived_key != -1) {
         return (unsigned char)g_derived_key;
@@ -146,6 +146,7 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
     return finalKey;
 }
 
+// 4. Base64 Decoder
 static int b64_char_val(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a' + 26;
