@@ -13,13 +13,14 @@
 static const char* AUTH_SECRET_KEY = "Sann_026_x9F";
 static int g_derived_key = -1;
 
-// TRIPWIRE STAGES:
-// 0x01 = JNI_OnLoad
-// 0x03 = Bootstrap/MyApplication loaded
-// 0x07 = AuthHelper handshake beacon verified
+// TRIPWIRE FLAGS:
+// 0x01 = JNI_OnLoad initialized
+// 0x02 = Bootstrap ContentProvider executed
+// 0x04 = AuthHelper beacon verified
 static volatile int g_tripwire_phase = 0;
+static volatile int g_decrypt_count = 0;
 
-// === 1. DIRECT SYSCALL KILL ===
+// 1. Direct Syscall Kill (ARM64 & ARMv7 Safe)
 static void silent_die() {
 #if defined(__aarch64__)
     register long x8 __asm__("x8") = 129; // __NR_kill ARM64
@@ -36,7 +37,7 @@ static void silent_die() {
     register long r1 __asm__("r1") = SIGKILL;
     __asm__ volatile(
         "push {r7}\n"
-        "mov r7, #37\n"       // 37 = __NR_kill ARMv7
+        "mov r7, #37\n"       // __NR_kill ARMv7
         "svc #0\n"
         "pop {r7}\n"
         : "=r"(r0)
@@ -49,7 +50,7 @@ static void silent_die() {
     _exit(0);
 }
 
-// === 2. ANTI-DEBUG TRACER & FRIDA PORT SCAN ===
+// 2. Anti-Debug Kernel Tracer Check
 static void check_tracer() {
     int fd = open("/proc/self/status", O_RDONLY);
     if (fd >= 0) {
@@ -66,7 +67,7 @@ static void check_tracer() {
     }
 }
 
-// === 3. FITUR 4: IN-MEMORY BINARY INTEGRITY CHECK (Anti-Hex-Patching) ===
+// 3. In-Memory Binary Self-Integrity Check (.text scan)
 static void verify_binary_integrity() {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (!fp) return;
@@ -82,17 +83,14 @@ static void verify_binary_integrity() {
     fclose(fp);
 
     if (base_addr != 0) {
-        uint32_t* pCode = (uint32_t*)base_addr;
-        // Pindai 256 instruksi pertama dari segmen eksekusi
-        for (int i = 0; i < 256; i++) {
+        uint32_t* pCode = (uint32_t*)(base_addr + 0x1000);
+        for (int i = 0; i < 512; i++) {
 #if defined(__aarch64__)
-            // Deteksi NOP opcode pada ARM64: 0xD503201F
-            if (pCode[i] == 0xD503201F) {
-                silent_die(); // Terdeteksi hex patch NOP
+            if (pCode[i] == 0xD503201F || pCode[i] == 0xD65F03C0) {
+                silent_die();
             }
 #elif defined(__arm__)
-            // Deteksi NOP opcode pada ARM32: 0xE1A00000
-            if (pCode[i] == 0xE1A00000) {
+            if (pCode[i] == 0xE1A00000 || pCode[i] == 0xE12FFF1E) {
                 silent_die();
             }
 #endif
@@ -100,7 +98,7 @@ static void verify_binary_integrity() {
     }
 }
 
-// === 4. DYNAMIC KEY DERIVATION DARI SIGNATURE APK ===
+// 4. Dynamic XOR Key Derivation dari Signature Runtime
 static unsigned char get_dynamic_key(JNIEnv* env) {
     if (g_derived_key != -1) return (unsigned char)g_derived_key;
 
@@ -206,28 +204,26 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
-// === 5. JNI INITIALIZATION ===
+// 5. JNI Exports
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     check_tracer();
     verify_binary_integrity();
-    g_tripwire_phase |= 0x01; // Stage 1 passed
+    g_tripwire_phase |= 0x01;
     return JNI_VERSION_1_6;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_sbx_Bootstrap_markBoot(JNIEnv *env, jclass clazz) {
-    g_tripwire_phase |= 0x02; // Stage 2 passed
+    g_tripwire_phase |= 0x02;
 }
 
 extern "C" JNIEXPORT void JNICALL
 Java_sbx_StringDecryptor_beacon(JNIEnv *env, jclass clazz, jlong nonce) {
-    // Validasi nonce tidak boleh nol
     if (nonce != 0) {
-        g_tripwire_phase |= 0x04; // Stage 3 passed
+        g_tripwire_phase |= 0x04;
     }
 }
 
-// === FITUR 2: ACTIVE DEFENSE TRIPWIRE DECRYPTOR ===
 extern "C" JNIEXPORT jstring JNICALL
 Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input) {
     if (!input) return nullptr;
@@ -235,9 +231,14 @@ Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input)
     check_tracer();
     verify_binary_integrity();
 
-    // Mutual Suicide Check:
-    // Jika fase awal (0x01 | 0x02 = 0x03) dilewati (misal Bootstrap dihapus dari manifest)
+    g_decrypt_count++;
+
     if ((g_tripwire_phase & 0x03) != 0x03) {
+        silent_die();
+        return nullptr;
+    }
+
+    if (g_decrypt_count > 15 && (g_tripwire_phase & 0x04) != 0x04) {
         silent_die();
         return nullptr;
     }
@@ -323,11 +324,10 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
         return JNI_FALSE;
     }
 
-    g_tripwire_phase |= 0x04; // Auth Handshake disahkan
+    g_tripwire_phase |= 0x04;
     return JNI_TRUE;
 }
 
-// === FITUR 5: ENCRYPTED SECONDARY IN-MEMORY DEX LOADER ===
 extern "C" JNIEXPORT jobject JNICALL
 Java_sbx_StringDecryptor_loadMemoryDex(JNIEnv *env, jclass clazz, jobject context, jbyteArray encDexBytes) {
     check_tracer();
@@ -341,22 +341,18 @@ Java_sbx_StringDecryptor_loadMemoryDex(JNIEnv *env, jclass clazz, jobject contex
     jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
     unsigned char key = get_dynamic_key(env);
 
-    // Dekripsi DEX di memori RAM
     unsigned char* decrypted = (unsigned char*)malloc(len);
     for (int i = 0; i < len; i++) {
         decrypted[i] = ((unsigned char)pData[i]) ^ key;
     }
     env->ReleaseByteArrayElements(encDexBytes, pData, JNI_ABORT);
 
-    // Buat ByteBuffer langsung ke buffer RAM
     jobject byteBuffer = env->NewDirectByteBuffer(decrypted, len);
 
-    // Ambil ClassLoader parent aplikasi
     jclass ctxCls = env->GetObjectClass(context);
     jmethodID getClassLoader = env->GetMethodID(ctxCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
     jobject parentLoader = env->CallObjectMethod(context, getClassLoader);
 
-    // Panggil InMemoryDexClassLoader (Android 8.0+)
     jclass inMemCls = env->FindClass("dalvik/system/InMemoryDexClassLoader");
     if (!inMemCls) {
         free(decrypted);
@@ -366,7 +362,6 @@ Java_sbx_StringDecryptor_loadMemoryDex(JNIEnv *env, jclass clazz, jobject contex
     jmethodID initMethod = env->GetMethodID(inMemCls, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
     jobject customLoader = env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
 
-    // Bersihkan buffer RAM setelah classloader mengambil alih
     memset(decrypted, 0, len);
     free(decrypted);
 
