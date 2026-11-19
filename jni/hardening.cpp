@@ -10,13 +10,13 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 
-static const char* AUTH_SECRET_KEY = "Sann_026_x9F";
-static int g_derived_key = -1;
+static uint8_t g_derived_key[32];
+static bool g_key_initialized = false;
 
 // TRIPWIRE FLAGS:
-// 0x01 = JNI_OnLoad initialized
+// 0x01 = JNI_OnLoad initialized & RegisterNatives bound
 // 0x02 = Bootstrap ContentProvider executed
-// 0x04 = AuthHelper beacon verified
+// 0x04 = AuthHelper beacon / token verified
 static volatile int g_tripwire_phase = 0;
 static volatile int g_decrypt_count = 0;
 
@@ -67,49 +67,77 @@ static void check_tracer() {
     }
 }
 
-// 3. In-Memory Binary Self-Integrity Check (.text scan)
-static void verify_binary_integrity() {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (!fp) return;
-
-    char line[512];
-    uintptr_t base_addr = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "libhardening.so") && strstr(line, "r-xp")) {
-            base_addr = (uintptr_t)strtoull(line, NULL, 16);
-            break;
+// 3. Function Prologue Patch Detector (Anti-NOP / Anti-Early-RET)
+static bool is_function_patched(void* func_ptr) {
+    if (!func_ptr) return false;
+#if defined(__aarch64__)
+    uint32_t* inst = (uint32_t*)func_ptr;
+    for (int i = 0; i < 4; i++) {
+        if (inst[i] == 0xD503201F || inst[i] == 0xD65F03C0) {
+            return true;
         }
     }
-    fclose(fp);
-
-    if (base_addr != 0) {
-        uint32_t* pCode = (uint32_t*)(base_addr + 0x1000);
-        for (int i = 0; i < 512; i++) {
-#if defined(__aarch64__)
-            if (pCode[i] == 0xD503201F || pCode[i] == 0xD65F03C0) {
-                silent_die();
-            }
 #elif defined(__arm__)
-            if (pCode[i] == 0xE1A00000 || pCode[i] == 0xE12FFF1E) {
+    uintptr_t addr = ((uintptr_t)func_ptr) & ~1ULL;
+    uint16_t* inst = (uint16_t*)addr;
+    for (int i = 0; i < 4; i++) {
+        if (inst[i] == 0x4770 || inst[i] == 0xBF00) {
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+// 4. In-Memory Binary Self-Integrity Check (RWX & Prologue Check)
+static void verify_binary_integrity() {
+    FILE* fp = fopen("/proc/self/maps", "r");
+    if (fp) {
+        char line[512];
+        while (fgets(line, sizeof(line), fp)) {
+            if (strstr(line, "libhardening.so") && strstr(line, "rwxp")) {
+                fclose(fp);
                 silent_die();
             }
-#endif
         }
+        fclose(fp);
+    }
+
+    if (is_function_patched((void*)&check_tracer)) {
+        silent_die();
     }
 }
 
-// 4. Dynamic XOR Key Derivation dari Signature Runtime
-static unsigned char get_dynamic_key(JNIEnv* env) {
-    if (g_derived_key != -1) return (unsigned char)g_derived_key;
+// 5. Rakit AUTH_SECRET_KEY di Stack (Mencegah deteksi perintah `strings`)
+static void get_auth_secret(char out[13]) {
+    // "Sann_026_x9F" di-XOR dengan 0x73
+    const uint8_t masked[12] = {
+        0x20, 0x12, 0x1D, 0x1D, 0x2C, 0x43,
+        0x41, 0x45, 0x2C, 0x0B, 0x4A, 0x35
+    };
+    for (int i = 0; i < 12; i++) {
+        out[i] = (char)(masked[i] ^ 0x73);
+    }
+    out[12] = '\0';
+}
+
+// 6. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
+static void set_fallback_key() {
+    memset(g_derived_key, 0x5A, 32);
+    g_key_initialized = true;
+}
+
+static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
+    if (g_key_initialized) return g_derived_key;
 
     jclass actThreadCls = env->FindClass("android/app/ActivityThread");
-    if (!actThreadCls) { g_derived_key = 0x5A; return 0x5A; }
+    if (!actThreadCls) { set_fallback_key(); return g_derived_key; }
 
     jmethodID currentAppMethod = env->GetStaticMethodID(actThreadCls, "currentApplication", "()Landroid/app/Application;");
-    if (!currentAppMethod) { g_derived_key = 0x5A; return 0x5A; }
+    if (!currentAppMethod) { set_fallback_key(); return g_derived_key; }
 
     jobject context = env->CallStaticObjectMethod(actThreadCls, currentAppMethod);
-    if (!context) { g_derived_key = 0x5A; return 0x5A; }
+    if (!context) { set_fallback_key(); return g_derived_key; }
 
     jclass ctxCls = env->GetObjectClass(context);
     jmethodID getPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
@@ -123,7 +151,7 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
 
     jobject pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x08000000);
     if (!pkgInfo) pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040);
-    if (!pkgInfo) { g_derived_key = 0x5A; return 0x5A; }
+    if (!pkgInfo) { set_fallback_key(); return g_derived_key; }
 
     jclass piCls = env->GetObjectClass(pkgInfo);
     jbyteArray certBytes = nullptr;
@@ -157,7 +185,7 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
         }
     }
 
-    if (!certBytes) { g_derived_key = 0x5A; return 0x5A; }
+    if (!certBytes) { set_fallback_key(); return g_derived_key; }
 
     jclass mdCls = env->FindClass("java/security/MessageDigest");
     jmethodID getInst = env->GetStaticMethodID(mdCls, "getInstance", "(Ljava/lang/String;)Ljava/security/MessageDigest;");
@@ -166,15 +194,17 @@ static unsigned char get_dynamic_key(JNIEnv* env) {
 
     jmethodID digestMethod = env->GetMethodID(mdCls, "digest", "([B)[B");
     jbyteArray digestBytes = (jbyteArray)env->CallObjectMethod(md, digestMethod, certBytes);
-    if (!digestBytes) { g_derived_key = 0x5A; return 0x5A; }
+    if (!digestBytes || env->GetArrayLength(digestBytes) < 32) {
+        set_fallback_key();
+        return g_derived_key;
+    }
 
     jbyte* pBytes = env->GetByteArrayElements(digestBytes, nullptr);
-    unsigned char finalKey = (unsigned char)pBytes[0];
-    if (finalKey == 0) finalKey = 0x5A;
+    memcpy(g_derived_key, pBytes, 32);
     env->ReleaseByteArrayElements(digestBytes, pBytes, JNI_ABORT);
 
-    g_derived_key = (int)finalKey;
-    return finalKey;
+    g_key_initialized = true;
+    return g_derived_key;
 }
 
 static int b64_char_val(char c) {
@@ -204,28 +234,18 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
-// 5. JNI Exports
-JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    check_tracer();
-    verify_binary_integrity();
-    g_tripwire_phase |= 0x01;
-    return JNI_VERSION_1_6;
-}
-
-extern "C" JNIEXPORT void JNICALL
-Java_sbx_Bootstrap_markBoot(JNIEnv *env, jclass clazz) {
+// 7. Native Implementation Functions (Bound dynamically via RegisterNatives)
+static void JNICALL native_mark_boot(JNIEnv *env, jclass clazz) {
     g_tripwire_phase |= 0x02;
 }
 
-extern "C" JNIEXPORT void JNICALL
-Java_sbx_StringDecryptor_beacon(JNIEnv *env, jclass clazz, jlong nonce) {
+static void JNICALL native_beacon(JNIEnv *env, jclass clazz, jlong nonce) {
     if (nonce != 0) {
         g_tripwire_phase |= 0x04;
     }
 }
 
-extern "C" JNIEXPORT jstring JNICALL
-Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input) {
+static jstring JNICALL native_decrypt(JNIEnv *env, jclass clazz, jstring input) {
     if (!input) return nullptr;
 
     check_tracer();
@@ -254,10 +274,10 @@ Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input)
     }
 
     int decoded_len = b64_decode(str, in_len, decoded);
-    unsigned char key = get_dynamic_key(env);
+    const uint8_t* key32 = get_dynamic_key_32(env);
 
     for (int i = 0; i < decoded_len; i++) {
-        decoded[i] ^= key;
+        decoded[i] ^= key32[i % 32];
     }
     decoded[decoded_len] = '\0';
 
@@ -267,8 +287,7 @@ Java_sbx_StringDecryptor_nativeDecrypt(JNIEnv *env, jclass clazz, jstring input)
     return result;
 }
 
-extern "C" JNIEXPORT jboolean JNICALL
-Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, jstring token, jlong ts) {
+static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring hwid, jstring token, jlong ts) {
     check_tracer();
     verify_binary_integrity();
 
@@ -277,11 +296,29 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
         return JNI_FALSE;
     }
 
+    // Anti-Replay Check: Validasi selisih waktu maksimal 3 menit (180.000 ms)
+    jclass sysCls = env->FindClass("java/lang/System");
+    if (sysCls) {
+        jmethodID curTimeId = env->GetStaticMethodID(sysCls, "currentTimeMillis", "()J");
+        if (curTimeId) {
+            jlong nowMs = env->CallStaticLongMethod(sysCls, curTimeId);
+            long long diff = (long long)(nowMs - ts);
+            if (diff < 0) diff = -diff;
+            if (diff > 180000LL) {
+                silent_die();
+                return JNI_FALSE;
+            }
+        }
+    }
+
     const char* cHwid = env->GetStringUTFChars(hwid, nullptr);
     const char* cToken = env->GetStringUTFChars(token, nullptr);
 
     char payload[256];
     snprintf(payload, sizeof(payload), "%s:%lld", cHwid, (long long)ts);
+
+    char secretKeyStr[13];
+    get_auth_secret(secretKeyStr);
 
     jclass macCls = env->FindClass("javax/crypto/Mac");
     jmethodID getMacInst = env->GetStaticMethodID(macCls, "getInstance", "(Ljava/lang/String;)Ljavax/crypto/Mac;");
@@ -291,9 +328,12 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
     jclass keySpecCls = env->FindClass("javax/crypto/spec/SecretKeySpec");
     jmethodID keySpecInit = env->GetMethodID(keySpecCls, "<init>", "([BLjava/lang/String;)V");
 
-    jbyteArray keyBytes = env->NewByteArray(strlen(AUTH_SECRET_KEY));
-    env->SetByteArrayRegion(keyBytes, 0, strlen(AUTH_SECRET_KEY), (const jbyte*)AUTH_SECRET_KEY);
+    jbyteArray keyBytes = env->NewByteArray(12);
+    env->SetByteArrayRegion(keyBytes, 0, 12, (const jbyte*)secretKeyStr);
     jobject secretKey = env->NewObject(keySpecCls, keySpecInit, keyBytes, algoStr);
+
+    // Hapus kunci dari stack segera setelah SecretKeySpec dibuat
+    memset(secretKeyStr, 0, sizeof(secretKeyStr));
 
     jmethodID macInit = env->GetMethodID(macCls, "init", "(Ljava/security/Key;)V");
     env->CallVoidMethod(mac, macInit, secretKey);
@@ -328,8 +368,7 @@ Java_sbx_StringDecryptor_verifyToken(JNIEnv *env, jclass clazz, jstring hwid, js
     return JNI_TRUE;
 }
 
-extern "C" JNIEXPORT jobject JNICALL
-Java_sbx_StringDecryptor_loadMemoryDex(JNIEnv *env, jclass clazz, jobject context, jbyteArray encDexBytes) {
+static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject context, jbyteArray encDexBytes) {
     check_tracer();
     verify_binary_integrity();
 
@@ -338,32 +377,107 @@ Java_sbx_StringDecryptor_loadMemoryDex(JNIEnv *env, jclass clazz, jobject contex
     jsize len = env->GetArrayLength(encDexBytes);
     if (len <= 0) return nullptr;
 
-    jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
-    unsigned char key = get_dynamic_key(env);
+    // Alokasi DirectByteBuffer milik Java agar siklus hidup memori aman (bebas use-after-free)
+    jclass bbCls = env->FindClass("java/nio/ByteBuffer");
+    jmethodID allocDirect = env->GetStaticMethodID(bbCls, "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
+    jobject byteBuffer = env->CallStaticObjectMethod(bbCls, allocDirect, len);
+    if (!byteBuffer) return nullptr;
 
-    unsigned char* decrypted = (unsigned char*)malloc(len);
+    uint8_t* dstPtr = (uint8_t*)env->GetDirectBufferAddress(byteBuffer);
+    if (!dstPtr) return nullptr;
+
+    jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
+    const uint8_t* key32 = get_dynamic_key_32(env);
+
     for (int i = 0; i < len; i++) {
-        decrypted[i] = ((unsigned char)pData[i]) ^ key;
+        dstPtr[i] = ((uint8_t)pData[i]) ^ key32[i % 32];
     }
     env->ReleaseByteArrayElements(encDexBytes, pData, JNI_ABORT);
-
-    jobject byteBuffer = env->NewDirectByteBuffer(decrypted, len);
 
     jclass ctxCls = env->GetObjectClass(context);
     jmethodID getClassLoader = env->GetMethodID(ctxCls, "getClassLoader", "()Ljava/lang/ClassLoader;");
     jobject parentLoader = env->CallObjectMethod(context, getClassLoader);
 
     jclass inMemCls = env->FindClass("dalvik/system/InMemoryDexClassLoader");
-    if (!inMemCls) {
-        free(decrypted);
-        return nullptr;
-    }
+    if (!inMemCls) return nullptr;
 
     jmethodID initMethod = env->GetMethodID(inMemCls, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V");
-    jobject customLoader = env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
+    return env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
+}
 
-    memset(decrypted, 0, len);
-    free(decrypted);
+// 8. Dynamic JNI Binding via AndroidManifest <meta-data>
+JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
+    check_tracer();
+    verify_binary_integrity();
 
-    return customLoader;
+    JNIEnv* env = nullptr;
+    if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) {
+        return JNI_ERR;
+    }
+
+    jclass actThreadCls = env->FindClass("android/app/ActivityThread");
+    if (!actThreadCls) { silent_die(); return JNI_ERR; }
+
+    jmethodID curAppId = env->GetStaticMethodID(actThreadCls, "currentApplication", "()Landroid/app/Application;");
+    jobject appCtx = env->CallStaticObjectMethod(actThreadCls, curAppId);
+    if (!appCtx) { silent_die(); return JNI_ERR; }
+
+    jclass ctxCls = env->GetObjectClass(appCtx);
+    jmethodID getPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
+    jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
+
+    jstring pkgName = (jstring)env->CallObjectMethod(appCtx, getPkgName);
+    jobject pkgMgr = env->CallObjectMethod(appCtx, getPkgMgr);
+
+    jclass pmCls = env->GetObjectClass(pkgMgr);
+    jmethodID getAppInfo = env->GetMethodID(pmCls, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
+    jobject appInfo = env->CallObjectMethod(pkgMgr, getAppInfo, pkgName, 0x00000080); // GET_META_DATA
+    if (!appInfo) { silent_die(); return JNI_ERR; }
+
+    jclass aiCls = env->GetObjectClass(appInfo);
+    jfieldID metaField = env->GetFieldID(aiCls, "metaData", "Landroid/os/Bundle;");
+    jobject metaBundle = env->GetObjectField(appInfo, metaField);
+    if (!metaBundle) { silent_die(); return JNI_ERR; }
+
+    jclass bundleCls = env->GetObjectClass(metaBundle);
+    jmethodID getString = env->GetMethodID(bundleCls, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
+    jstring metaKey = env->NewStringUTF("androidx.startup.profile");
+    jstring metaVal = (jstring)env->CallObjectMethod(metaBundle, getString, metaKey);
+    if (!metaVal) { silent_die(); return JNI_ERR; }
+
+    const char* rawCfg = env->GetStringUTFChars(metaVal, nullptr);
+    char cfgBuf[256];
+    strncpy(cfgBuf, rawCfg, sizeof(cfgBuf) - 1);
+    cfgBuf[sizeof(cfgBuf) - 1] = '\0';
+    env->ReleaseStringUTFChars(metaVal, rawCfg);
+
+    // Format cfgBuf: "pkg/BootClass|pkg/DecryptClass"
+    char* sep = strchr(cfgBuf, '|');
+    if (!sep) { silent_die(); return JNI_ERR; }
+    *sep = '\0';
+    const char* bootClassName = cfgBuf;
+    const char* decClassName = sep + 1;
+
+    jclass bootCls = env->FindClass(bootClassName);
+    jclass decCls = env->FindClass(decClassName);
+    if (!bootCls || !decCls) { silent_die(); return JNI_ERR; }
+
+    static const JNINativeMethod bootMethods[] = {
+        { "markBoot", "()V", (void*)&native_mark_boot }
+    };
+    static const JNINativeMethod decMethods[] = {
+        { "nativeDecrypt", "(Ljava/lang/String;)Ljava/lang/String;", (void*)&native_decrypt },
+        { "verifyToken", "(Ljava/lang/String;Ljava/lang/String;J)Z", (void*)&native_verify_token },
+        { "beacon", "(J)V", (void*)&native_beacon },
+        { "loadMemoryDex", "(Landroid/content/Context;[B)Ljava/lang/ClassLoader;", (void*)&native_load_memory_dex }
+    };
+
+    if (env->RegisterNatives(bootCls, bootMethods, 1) < 0 ||
+        env->RegisterNatives(decCls, decMethods, 4) < 0) {
+        silent_die();
+        return JNI_ERR;
+    }
+
+    g_tripwire_phase |= 0x01;
+    return JNI_VERSION_1_6;
 }
