@@ -15,7 +15,7 @@ static bool g_key_initialized = false;
 
 // TRIPWIRE FLAGS:
 // 0x01 = JNI_OnLoad initialized & RegisterNatives bound
-// 0x02 = Bootstrap ContentProvider executed
+// 0x02 = Bootstrap / MyApplication boot marked
 // 0x04 = AuthHelper beacon / token verified
 static volatile int g_tripwire_phase = 0;
 static volatile int g_decrypt_count = 0;
@@ -67,7 +67,7 @@ static void check_tracer() {
     }
 }
 
-// 3. Function Prologue Patch Detector (Anti-NOP / Anti-Early-RET)
+// 3. Function Prologue Patch Detector
 static bool is_function_patched(void* func_ptr) {
     if (!func_ptr) return false;
 #if defined(__aarch64__)
@@ -89,7 +89,7 @@ static bool is_function_patched(void* func_ptr) {
     return false;
 }
 
-// 4. In-Memory Binary Self-Integrity Check (RWX & Prologue Check)
+// 4. In-Memory Binary Self-Integrity Check
 static void verify_binary_integrity() {
     FILE* fp = fopen("/proc/self/maps", "r");
     if (fp) {
@@ -108,9 +108,43 @@ static void verify_binary_integrity() {
     }
 }
 
-// 5. Rakit AUTH_SECRET_KEY di Stack (Mencegah deteksi perintah `strings`)
+// 5. Helper: Ambil SystemContext & PackageName (Aman bahkan sebelum Application.onCreate)
+static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
+    char pkgBuf[256] = {0};
+    int fd = open("/proc/self/cmdline", O_RDONLY);
+    if (fd >= 0) {
+        ssize_t n = read(fd, pkgBuf, sizeof(pkgBuf) - 1);
+        close(fd);
+        if (n > 0) {
+            pkgBuf[n] = '\0';
+            char* colon = strchr(pkgBuf, ':');
+            if (colon) *colon = '\0';
+        }
+    }
+    if (pkgBuf[0] == '\0') return false;
+
+    jclass atCls = env->FindClass("android/app/ActivityThread");
+    if (!atCls) return false;
+
+    jmethodID curAtId = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
+    if (!curAtId) return false;
+
+    jobject atObj = env->CallStaticObjectMethod(atCls, curAtId);
+    if (!atObj) return false;
+
+    jmethodID getSysCtxId = env->GetMethodID(atCls, "getSystemContext", "()Landroid/app/ContextImpl;");
+    if (!getSysCtxId) return false;
+
+    jobject sysCtx = env->CallObjectMethod(atObj, getSysCtxId);
+    if (!sysCtx) return false;
+
+    *outCtx = sysCtx;
+    *outPkg = env->NewStringUTF(pkgBuf);
+    return (*outPkg != nullptr);
+}
+
+// 6. Rakit AUTH_SECRET_KEY di Stack
 static void get_auth_secret(char out[13]) {
-    // "Sann_026_x9F" di-XOR dengan 0x73
     const uint8_t masked[12] = {
         0x20, 0x12, 0x1D, 0x1D, 0x2C, 0x43,
         0x41, 0x45, 0x2C, 0x0B, 0x4A, 0x35
@@ -121,7 +155,7 @@ static void get_auth_secret(char out[13]) {
     out[12] = '\0';
 }
 
-// 6. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
+// 7. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
 static void set_fallback_key() {
     memset(g_derived_key, 0x5A, 32);
     g_key_initialized = true;
@@ -130,21 +164,17 @@ static void set_fallback_key() {
 static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
     if (g_key_initialized) return g_derived_key;
 
-    jclass actThreadCls = env->FindClass("android/app/ActivityThread");
-    if (!actThreadCls) { set_fallback_key(); return g_derived_key; }
-
-    jmethodID currentAppMethod = env->GetStaticMethodID(actThreadCls, "currentApplication", "()Landroid/app/Application;");
-    if (!currentAppMethod) { set_fallback_key(); return g_derived_key; }
-
-    jobject context = env->CallStaticObjectMethod(actThreadCls, currentAppMethod);
-    if (!context) { set_fallback_key(); return g_derived_key; }
+    jobject context = nullptr;
+    jstring pkgName = nullptr;
+    if (!get_ctx_and_pkg(env, &context, &pkgName)) {
+        set_fallback_key();
+        return g_derived_key;
+    }
 
     jclass ctxCls = env->GetObjectClass(context);
-    jmethodID getPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
     jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-
-    jstring pkgName = (jstring)env->CallObjectMethod(context, getPkgName);
     jobject pkgMgr = env->CallObjectMethod(context, getPkgMgr);
+    if (!pkgMgr) { set_fallback_key(); return g_derived_key; }
 
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getPkgInfo = env->GetMethodID(pmCls, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
@@ -234,7 +264,7 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
-// 7. Native Implementation Functions (Bound dynamically via RegisterNatives)
+// 8. Native Implementation Functions
 static void JNICALL native_mark_boot(JNIEnv *env, jclass clazz) {
     g_tripwire_phase |= 0x02;
 }
@@ -258,7 +288,8 @@ static jstring JNICALL native_decrypt(JNIEnv *env, jclass clazz, jstring input) 
         return nullptr;
     }
 
-    if (g_decrypt_count > 15 && (g_tripwire_phase & 0x04) != 0x04) {
+    // Beri toleransi 500 string untuk inisialisasi SDK di Application.onCreate() sebelum Activity muncul
+    if (g_decrypt_count > 500 && (g_tripwire_phase & 0x04) != 0x04) {
         silent_die();
         return nullptr;
     }
@@ -296,7 +327,6 @@ static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring h
         return JNI_FALSE;
     }
 
-    // Anti-Replay Check: Validasi selisih waktu maksimal 3 menit (180.000 ms)
     jclass sysCls = env->FindClass("java/lang/System");
     if (sysCls) {
         jmethodID curTimeId = env->GetStaticMethodID(sysCls, "currentTimeMillis", "()J");
@@ -332,7 +362,6 @@ static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring h
     env->SetByteArrayRegion(keyBytes, 0, 12, (const jbyte*)secretKeyStr);
     jobject secretKey = env->NewObject(keySpecCls, keySpecInit, keyBytes, algoStr);
 
-    // Hapus kunci dari stack segera setelah SecretKeySpec dibuat
     memset(secretKeyStr, 0, sizeof(secretKeyStr));
 
     jmethodID macInit = env->GetMethodID(macCls, "init", "(Ljava/security/Key;)V");
@@ -377,7 +406,6 @@ static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject
     jsize len = env->GetArrayLength(encDexBytes);
     if (len <= 0) return nullptr;
 
-    // Alokasi DirectByteBuffer milik Java agar siklus hidup memori aman (bebas use-after-free)
     jclass bbCls = env->FindClass("java/nio/ByteBuffer");
     jmethodID allocDirect = env->GetStaticMethodID(bbCls, "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
     jobject byteBuffer = env->CallStaticObjectMethod(bbCls, allocDirect, len);
@@ -405,7 +433,7 @@ static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject
     return env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
 }
 
-// 8. Dynamic JNI Binding via AndroidManifest <meta-data>
+// 9. Dynamic JNI Binding via AndroidManifest <meta-data>
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     check_tracer();
     verify_binary_integrity();
@@ -415,19 +443,17 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
         return JNI_ERR;
     }
 
-    jclass actThreadCls = env->FindClass("android/app/ActivityThread");
-    if (!actThreadCls) { silent_die(); return JNI_ERR; }
+    jobject sysCtx = nullptr;
+    jstring pkgName = nullptr;
+    if (!get_ctx_and_pkg(env, &sysCtx, &pkgName)) {
+        silent_die();
+        return JNI_ERR;
+    }
 
-    jmethodID curAppId = env->GetStaticMethodID(actThreadCls, "currentApplication", "()Landroid/app/Application;");
-    jobject appCtx = env->CallStaticObjectMethod(actThreadCls, curAppId);
-    if (!appCtx) { silent_die(); return JNI_ERR; }
-
-    jclass ctxCls = env->GetObjectClass(appCtx);
-    jmethodID getPkgName = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
+    jclass ctxCls = env->GetObjectClass(sysCtx);
     jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
-
-    jstring pkgName = (jstring)env->CallObjectMethod(appCtx, getPkgName);
-    jobject pkgMgr = env->CallObjectMethod(appCtx, getPkgMgr);
+    jobject pkgMgr = env->CallObjectMethod(sysCtx, getPkgMgr);
+    if (!pkgMgr) { silent_die(); return JNI_ERR; }
 
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getAppInfo = env->GetMethodID(pmCls, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
@@ -451,7 +477,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     cfgBuf[sizeof(cfgBuf) - 1] = '\0';
     env->ReleaseStringUTFChars(metaVal, rawCfg);
 
-    // Format cfgBuf: "pkg/BootClass|pkg/DecryptClass"
     char* sep = strchr(cfgBuf, '|');
     if (!sep) { silent_die(); return JNI_ERR; }
     *sep = '\0';
