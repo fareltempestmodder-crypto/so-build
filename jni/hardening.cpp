@@ -108,7 +108,7 @@ static void verify_binary_integrity() {
     }
 }
 
-// 5. Helper: Ambil SystemContext & PackageName (Aman bahkan sebelum Application.onCreate)
+// 5. Helper Context Aman untuk ColorOS & Android 15 (Dual Fallback)
 static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
     char pkgBuf[256] = {0};
     int fd = open("/proc/self/cmdline", O_RDONLY);
@@ -121,21 +121,48 @@ static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
             if (colon) *colon = '\0';
         }
     }
-    if (pkgBuf[0] == '\0') return false;
 
     jclass atCls = env->FindClass("android/app/ActivityThread");
-    if (!atCls) return false;
+    if (!atCls) {
+        env->ExceptionClear();
+        return false;
+    }
+
+    // Jalur 1: Coba currentApplication() terlebih dahulu
+    jmethodID curAppId = env->GetStaticMethodID(atCls, "currentApplication", "()Landroid/app/Application;");
+    if (curAppId) {
+        jobject appObj = env->CallStaticObjectMethod(atCls, curAppId);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (appObj) {
+            *outCtx = appObj;
+            if (pkgBuf[0] != '\0') {
+                *outPkg = env->NewStringUTF(pkgBuf);
+            } else {
+                jclass ctxCls = env->GetObjectClass(appObj);
+                jmethodID getPkgId = env->GetMethodID(ctxCls, "getPackageName", "()Ljava/lang/String;");
+                *outPkg = (jstring)env->CallObjectMethod(appObj, getPkgId);
+            }
+            return (*outPkg != nullptr);
+        }
+    } else {
+        env->ExceptionClear();
+    }
+
+    // Jalur 2: Fallback ke currentActivityThread().getSystemContext()
+    if (pkgBuf[0] == '\0') return false;
 
     jmethodID curAtId = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
-    if (!curAtId) return false;
+    if (!curAtId) { env->ExceptionClear(); return false; }
 
     jobject atObj = env->CallStaticObjectMethod(atCls, curAtId);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!atObj) return false;
 
     jmethodID getSysCtxId = env->GetMethodID(atCls, "getSystemContext", "()Landroid/app/ContextImpl;");
-    if (!getSysCtxId) return false;
+    if (!getSysCtxId) { env->ExceptionClear(); return false; }
 
     jobject sysCtx = env->CallObjectMethod(atObj, getSysCtxId);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!sysCtx) return false;
 
     *outCtx = sysCtx;
@@ -174,13 +201,18 @@ static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
     jclass ctxCls = env->GetObjectClass(context);
     jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
     jobject pkgMgr = env->CallObjectMethod(context, getPkgMgr);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!pkgMgr) { set_fallback_key(); return g_derived_key; }
 
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getPkgInfo = env->GetMethodID(pmCls, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
 
     jobject pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x08000000);
-    if (!pkgInfo) pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (!pkgInfo) {
+        pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040);
+        if (env->ExceptionCheck()) env->ExceptionClear();
+    }
     if (!pkgInfo) { set_fallback_key(); return g_derived_key; }
 
     jclass piCls = env->GetObjectClass(pkgInfo);
@@ -193,6 +225,7 @@ static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
             jclass siCls = env->GetObjectClass(signingInfo);
             jmethodID getSigners = env->GetMethodID(siCls, "getApkContentsSigners", "()[Landroid/content/pm/Signature;");
             jobjectArray sigs = (jobjectArray)env->CallObjectMethod(signingInfo, getSigners);
+            if (env->ExceptionCheck()) env->ExceptionClear();
             if (sigs && env->GetArrayLength(sigs) > 0) {
                 jobject sig = env->GetObjectArrayElement(sigs, 0);
                 jclass sigCls = env->GetObjectClass(sig);
@@ -200,6 +233,8 @@ static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
                 certBytes = (jbyteArray)env->CallObjectMethod(sig, toByteArr);
             }
         }
+    } else {
+        env->ExceptionClear();
     }
 
     if (!certBytes) {
@@ -212,6 +247,8 @@ static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
                 jmethodID toByteArr = env->GetMethodID(sigCls, "toByteArray", "()[B");
                 certBytes = (jbyteArray)env->CallObjectMethod(sig, toByteArr);
             }
+        } else {
+            env->ExceptionClear();
         }
     }
 
@@ -283,13 +320,14 @@ static jstring JNICALL native_decrypt(JNIEnv *env, jclass clazz, jstring input) 
 
     g_decrypt_count++;
 
+    // Pastikan JNI_OnLoad (0x01) dan Bootstrap/MyApplication (0x02) sudah berjalan
     if ((g_tripwire_phase & 0x03) != 0x03) {
         silent_die();
         return nullptr;
     }
 
-    // Beri toleransi 500 string untuk inisialisasi SDK di Application.onCreate() sebelum Activity muncul
-    if (g_decrypt_count > 500 && (g_tripwire_phase & 0x04) != 0x04) {
+    // Batas 2500 string sebelum beacon agar inisialisasi UI/WebView Android 15 tidak terputus
+    if (g_decrypt_count > 2500 && (g_tripwire_phase & 0x04) != 0x04) {
         silent_die();
         return nullptr;
     }
@@ -327,6 +365,7 @@ static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring h
         return JNI_FALSE;
     }
 
+    // Toleransi selisih jam perangkat hingga 24 jam (86400000 ms) agar jam manual HP tidak memicu kill
     jclass sysCls = env->FindClass("java/lang/System");
     if (sysCls) {
         jmethodID curTimeId = env->GetStaticMethodID(sysCls, "currentTimeMillis", "()J");
@@ -334,7 +373,7 @@ static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring h
             jlong nowMs = env->CallStaticLongMethod(sysCls, curTimeId);
             long long diff = (long long)(nowMs - ts);
             if (diff < 0) diff = -diff;
-            if (diff > 180000LL) {
+            if (diff > 86400000LL) {
                 silent_die();
                 return JNI_FALSE;
             }
@@ -404,18 +443,34 @@ static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject
     if (!context || !encDexBytes) return nullptr;
 
     jsize len = env->GetArrayLength(encDexBytes);
-    if (len <= 0) return nullptr;
+    if (len < 112) return nullptr; // Minimal ukuran header DEX valid adalah 112 byte
+
+    jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
+    const uint8_t* key32 = get_dynamic_key_32(env);
+
+    // Cek magic bytes "dex\n" sebelum alokasi InMemoryDexClassLoader agar ART Android 15 tidak abort
+    uint8_t magic[4];
+    for (int i = 0; i < 4; i++) {
+        magic[i] = ((uint8_t)pData[i]) ^ key32[i % 32];
+    }
+    if (magic[0] != 'd' || magic[1] != 'e' || magic[2] != 'x' || magic[3] != '\n') {
+        env->ReleaseByteArrayElements(encDexBytes, pData, JNI_ABORT);
+        return nullptr;
+    }
 
     jclass bbCls = env->FindClass("java/nio/ByteBuffer");
     jmethodID allocDirect = env->GetStaticMethodID(bbCls, "allocateDirect", "(I)Ljava/nio/ByteBuffer;");
     jobject byteBuffer = env->CallStaticObjectMethod(bbCls, allocDirect, len);
-    if (!byteBuffer) return nullptr;
+    if (!byteBuffer) {
+        env->ReleaseByteArrayElements(encDexBytes, pData, JNI_ABORT);
+        return nullptr;
+    }
 
     uint8_t* dstPtr = (uint8_t*)env->GetDirectBufferAddress(byteBuffer);
-    if (!dstPtr) return nullptr;
-
-    jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
-    const uint8_t* key32 = get_dynamic_key_32(env);
+    if (!dstPtr) {
+        env->ReleaseByteArrayElements(encDexBytes, pData, JNI_ABORT);
+        return nullptr;
+    }
 
     for (int i = 0; i < len; i++) {
         dstPtr[i] = ((uint8_t)pData[i]) ^ key32[i % 32];
@@ -453,11 +508,13 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     jclass ctxCls = env->GetObjectClass(sysCtx);
     jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
     jobject pkgMgr = env->CallObjectMethod(sysCtx, getPkgMgr);
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!pkgMgr) { silent_die(); return JNI_ERR; }
 
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getAppInfo = env->GetMethodID(pmCls, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
     jobject appInfo = env->CallObjectMethod(pkgMgr, getAppInfo, pkgName, 0x00000080); // GET_META_DATA
+    if (env->ExceptionCheck()) env->ExceptionClear();
     if (!appInfo) { silent_die(); return JNI_ERR; }
 
     jclass aiCls = env->GetObjectClass(appInfo);
