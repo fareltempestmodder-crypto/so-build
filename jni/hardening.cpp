@@ -436,10 +436,8 @@ static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject
     return env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
 }
 
-// 7. Dynamic JNI Binding via AndroidManifest <meta-data>
+// 7. Dynamic JNI Binding via AndroidManifest <meta-data> (Safe Init tanpa silent_die)
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
-    check_tracer();
-
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) {
         return JNI_ERR;
@@ -448,7 +446,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     jobject sysCtx = nullptr;
     jstring pkgName = nullptr;
     if (!get_ctx_and_pkg(env, &sysCtx, &pkgName)) {
-        silent_die();
         return JNI_ERR;
     }
 
@@ -456,24 +453,24 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     jmethodID getPkgMgr = env->GetMethodID(ctxCls, "getPackageManager", "()Landroid/content/pm/PackageManager;");
     jobject pkgMgr = env->CallObjectMethod(sysCtx, getPkgMgr);
     if (env->ExceptionCheck()) env->ExceptionClear();
-    if (!pkgMgr) { silent_die(); return JNI_ERR; }
+    if (!pkgMgr) return JNI_ERR;
 
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getAppInfo = env->GetMethodID(pmCls, "getApplicationInfo", "(Ljava/lang/String;I)Landroid/content/pm/ApplicationInfo;");
     jobject appInfo = env->CallObjectMethod(pkgMgr, getAppInfo, pkgName, 0x00000080); // GET_META_DATA
     if (env->ExceptionCheck()) env->ExceptionClear();
-    if (!appInfo) { silent_die(); return JNI_ERR; }
+    if (!appInfo) return JNI_ERR;
 
     jclass aiCls = env->GetObjectClass(appInfo);
     jfieldID metaField = env->GetFieldID(aiCls, "metaData", "Landroid/os/Bundle;");
     jobject metaBundle = env->GetObjectField(appInfo, metaField);
-    if (!metaBundle) { silent_die(); return JNI_ERR; }
+    if (!metaBundle) return JNI_ERR;
 
     jclass bundleCls = env->GetObjectClass(metaBundle);
     jmethodID getString = env->GetMethodID(bundleCls, "getString", "(Ljava/lang/String;)Ljava/lang/String;");
     jstring metaKey = env->NewStringUTF("androidx.startup.profile");
     jstring metaVal = (jstring)env->CallObjectMethod(metaBundle, getString, metaKey);
-    if (!metaVal) { silent_die(); return JNI_ERR; }
+    if (!metaVal) return JNI_ERR;
 
     const char* rawCfg = env->GetStringUTFChars(metaVal, nullptr);
     char cfgBuf[256];
@@ -482,14 +479,14 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     env->ReleaseStringUTFChars(metaVal, rawCfg);
 
     char* sep = strchr(cfgBuf, '|');
-    if (!sep) { silent_die(); return JNI_ERR; }
+    if (!sep) return JNI_ERR;
     *sep = '\0';
     const char* bootClassName = cfgBuf;
     const char* decClassName = sep + 1;
 
     jclass bootCls = env->FindClass(bootClassName);
     jclass decCls = env->FindClass(decClassName);
-    if (!bootCls || !decCls) { silent_die(); return JNI_ERR; }
+    if (!bootCls || !decCls) return JNI_ERR;
 
     static const JNINativeMethod bootMethods[] = {
         { "markBoot", "()V", (void*)&native_mark_boot }
@@ -503,7 +500,6 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
 
     if (env->RegisterNatives(bootCls, bootMethods, 1) < 0 ||
         env->RegisterNatives(decCls, decMethods, 4) < 0) {
-        silent_die();
         return JNI_ERR;
     }
 
