@@ -8,7 +8,6 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <sys/syscall.h>
-#include <sys/mman.h>
 
 static uint8_t g_derived_key[32];
 static bool g_key_initialized = false;
@@ -67,48 +66,7 @@ static void check_tracer() {
     }
 }
 
-// 3. Function Prologue Patch Detector
-static bool is_function_patched(void* func_ptr) {
-    if (!func_ptr) return false;
-#if defined(__aarch64__)
-    uint32_t* inst = (uint32_t*)func_ptr;
-    for (int i = 0; i < 4; i++) {
-        if (inst[i] == 0xD503201F || inst[i] == 0xD65F03C0) {
-            return true;
-        }
-    }
-#elif defined(__arm__)
-    uintptr_t addr = ((uintptr_t)func_ptr) & ~1ULL;
-    uint16_t* inst = (uint16_t*)addr;
-    for (int i = 0; i < 4; i++) {
-        if (inst[i] == 0x4770 || inst[i] == 0xBF00) {
-            return true;
-        }
-    }
-#endif
-    return false;
-}
-
-// 4. In-Memory Binary Self-Integrity Check
-static void verify_binary_integrity() {
-    FILE* fp = fopen("/proc/self/maps", "r");
-    if (fp) {
-        char line[512];
-        while (fgets(line, sizeof(line), fp)) {
-            if (strstr(line, "libhardening.so") && strstr(line, "rwxp")) {
-                fclose(fp);
-                silent_die();
-            }
-        }
-        fclose(fp);
-    }
-
-    if (is_function_patched((void*)&check_tracer)) {
-        silent_die();
-    }
-}
-
-// 5. Helper Context Aman untuk ColorOS & Android 15 (Dual Fallback)
+// 3. Helper Context Universal (Android 10 - Android 15 / ColorOS / realme UI)
 static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
     char pkgBuf[256] = {0};
     int fd = open("/proc/self/cmdline", O_RDONLY);
@@ -128,7 +86,7 @@ static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
         return false;
     }
 
-    // Jalur 1: Coba currentApplication() terlebih dahulu
+    // Jalur 1: currentApplication()
     jmethodID curAppId = env->GetStaticMethodID(atCls, "currentApplication", "()Landroid/app/Application;");
     if (curAppId) {
         jobject appObj = env->CallStaticObjectMethod(atCls, curAppId);
@@ -148,7 +106,7 @@ static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
         env->ExceptionClear();
     }
 
-    // Jalur 2: Fallback ke currentActivityThread().getSystemContext()
+    // Jalur 2: currentActivityThread().getSystemContext()
     if (pkgBuf[0] == '\0') return false;
 
     jmethodID curAtId = env->GetStaticMethodID(atCls, "currentActivityThread", "()Landroid/app/ActivityThread;");
@@ -170,7 +128,7 @@ static bool get_ctx_and_pkg(JNIEnv* env, jobject* outCtx, jstring* outPkg) {
     return (*outPkg != nullptr);
 }
 
-// 6. Rakit AUTH_SECRET_KEY di Stack
+// 4. Rakit AUTH_SECRET_KEY di Stack ("Sann_026_x9F")
 static void get_auth_secret(char out[13]) {
     const uint8_t masked[12] = {
         0x20, 0x12, 0x1D, 0x1D, 0x2C, 0x43,
@@ -182,7 +140,7 @@ static void get_auth_secret(char out[13]) {
     out[12] = '\0';
 }
 
-// 7. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
+// 5. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
 static void set_fallback_key() {
     memset(g_derived_key, 0x5A, 32);
     g_key_initialized = true;
@@ -207,10 +165,10 @@ static const uint8_t* get_dynamic_key_32(JNIEnv* env) {
     jclass pmCls = env->GetObjectClass(pkgMgr);
     jmethodID getPkgInfo = env->GetMethodID(pmCls, "getPackageInfo", "(Ljava/lang/String;I)Landroid/content/pm/PackageInfo;");
 
-    jobject pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x08000000);
+    jobject pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x08000000); // GET_SIGNING_CERTIFICATES
     if (env->ExceptionCheck()) env->ExceptionClear();
     if (!pkgInfo) {
-        pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040);
+        pkgInfo = env->CallObjectMethod(pkgMgr, getPkgInfo, pkgName, 0x00000040); // GET_SIGNATURES
         if (env->ExceptionCheck()) env->ExceptionClear();
     }
     if (!pkgInfo) { set_fallback_key(); return g_derived_key; }
@@ -301,7 +259,7 @@ static int b64_decode(const char* in, int in_len, unsigned char* out) {
     return out_len;
 }
 
-// 8. Native Implementation Functions
+// 6. Native Implementation Functions
 static void JNICALL native_mark_boot(JNIEnv *env, jclass clazz) {
     g_tripwire_phase |= 0x02;
 }
@@ -316,18 +274,14 @@ static jstring JNICALL native_decrypt(JNIEnv *env, jclass clazz, jstring input) 
     if (!input) return nullptr;
 
     check_tracer();
-    verify_binary_integrity();
-
     g_decrypt_count++;
 
-    // Pastikan JNI_OnLoad (0x01) dan Bootstrap/MyApplication (0x02) sudah berjalan
     if ((g_tripwire_phase & 0x03) != 0x03) {
         silent_die();
         return nullptr;
     }
 
-    // Batas 2500 string sebelum beacon agar inisialisasi UI/WebView Android 15 tidak terputus
-    if (g_decrypt_count > 2500 && (g_tripwire_phase & 0x04) != 0x04) {
+    if (g_decrypt_count > 5000 && (g_tripwire_phase & 0x04) != 0x04) {
         silent_die();
         return nullptr;
     }
@@ -358,14 +312,12 @@ static jstring JNICALL native_decrypt(JNIEnv *env, jclass clazz, jstring input) 
 
 static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring hwid, jstring token, jlong ts) {
     check_tracer();
-    verify_binary_integrity();
 
     if (!hwid || !token) {
         silent_die();
         return JNI_FALSE;
     }
 
-    // Toleransi selisih jam perangkat hingga 24 jam (86400000 ms) agar jam manual HP tidak memicu kill
     jclass sysCls = env->FindClass("java/lang/System");
     if (sysCls) {
         jmethodID curTimeId = env->GetStaticMethodID(sysCls, "currentTimeMillis", "()J");
@@ -437,18 +389,14 @@ static jboolean JNICALL native_verify_token(JNIEnv *env, jclass clazz, jstring h
 }
 
 static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject context, jbyteArray encDexBytes) {
-    check_tracer();
-    verify_binary_integrity();
-
     if (!context || !encDexBytes) return nullptr;
 
     jsize len = env->GetArrayLength(encDexBytes);
-    if (len < 112) return nullptr; // Minimal ukuran header DEX valid adalah 112 byte
+    if (len < 112) return nullptr;
 
     jbyte* pData = env->GetByteArrayElements(encDexBytes, nullptr);
     const uint8_t* key32 = get_dynamic_key_32(env);
 
-    // Cek magic bytes "dex\n" sebelum alokasi InMemoryDexClassLoader agar ART Android 15 tidak abort
     uint8_t magic[4];
     for (int i = 0; i < 4; i++) {
         magic[i] = ((uint8_t)pData[i]) ^ key32[i % 32];
@@ -488,10 +436,9 @@ static jobject JNICALL native_load_memory_dex(JNIEnv *env, jclass clazz, jobject
     return env->NewObject(inMemCls, initMethod, byteBuffer, parentLoader);
 }
 
-// 9. Dynamic JNI Binding via AndroidManifest <meta-data>
+// 7. Dynamic JNI Binding via AndroidManifest <meta-data>
 JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     check_tracer();
-    verify_binary_integrity();
 
     JNIEnv* env = nullptr;
     if (vm->GetEnv((void**)&env, JNI_VERSION_1_6) != JNI_OK || !env) {
