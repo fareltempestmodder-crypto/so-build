@@ -140,6 +140,50 @@ static void get_auth_secret(char out[13]) {
     out[12] = '\0';
 }
 
+// Rakit URL Endpoint di Stack (XOR 0x55) - Zero Plaintext di Binary .so & Smali
+static jstring build_validate_url(JNIEnv* env, jclass clazz) {
+    // "http://zanspterodactyl.shoppanel.my.id:2037/api/auth/validate" (61 bytes)
+    const uint8_t enc[61] = {
+        0x3D, 0x21, 0x21, 0x25, 0x6F, 0x7A, 0x7A,
+        0x2F, 0x34, 0x3B, 0x26, 0x25, 0x21, 0x30, 0x27, 0x3A, 0x31, 0x34, 0x36, 0x21, 0x2C, 0x39,
+        0x7B, 0x26, 0x3D, 0x3A, 0x25, 0x25, 0x34, 0x3B, 0x30, 0x39,
+        0x7B, 0x38, 0x2C, 0x7B, 0x3C, 0x31,
+        0x6F, 0x67, 0x65, 0x66, 0x62,
+        0x7A, 0x34, 0x25, 0x3C, 0x7A, 0x34, 0x20, 0x21, 0x3D, 0x7A,
+        0x23, 0x34, 0x39, 0x3C, 0x31, 0x34, 0x21, 0x30
+    };
+    char buf[62];
+    for (int i = 0; i < 61; i++) {
+        buf[i] = (char)(enc[i] ^ 0x55);
+    }
+    buf[61] = '\0';
+    jstring res = env->NewStringUTF(buf);
+    memset(buf, 0, sizeof(buf));
+    return res;
+}
+
+static jstring build_crash_url(JNIEnv* env, jclass clazz) {
+    // "http://zanspterodactyl.shoppanel.my.id:2037/api/auth/crash" (58 bytes)
+    const uint8_t enc[58] = {
+        0x3D, 0x21, 0x21, 0x25, 0x6F, 0x7A, 0x7A,
+        0x2F, 0x34, 0x3B, 0x26, 0x25, 0x21, 0x30, 0x27, 0x3A, 0x31, 0x34, 0x36, 0x21, 0x2C, 0x39,
+        0x7B, 0x26, 0x3D, 0x3A, 0x25, 0x25, 0x34, 0x3B, 0x30, 0x39,
+        0x7B, 0x38, 0x2C, 0x7B, 0x3C, 0x31,
+        0x6F, 0x67, 0x65, 0x66, 0x62,
+        0x7A, 0x34, 0x25, 0x3C, 0x7A, 0x34, 0x20, 0x21, 0x3D, 0x7A,
+        0x36, 0x27, 0x34, 0x26, 0x3D
+    };
+    char buf[59];
+    for (int i = 0; i < 58; i++) {
+        buf[i] = (char)(enc[i] ^ 0x55);
+    }
+    buf[58] = '\0';
+    jstring res = env->NewStringUTF(buf);
+    memset(buf, 0, sizeof(buf));
+    return res;
+}
+
+
 // 5. 32-Byte Rolling SHA-256 Key Derivation dari Signature Runtime
 static void set_fallback_key() {
     memset(g_derived_key, 0x5A, 32);
@@ -491,15 +535,17 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     static const JNINativeMethod bootMethods[] = {
         { "markBoot", "()V", (void*)&native_mark_boot }
     };
-    static const JNINativeMethod decMethods[] = {
+        static const JNINativeMethod decMethods[] = {
         { "nativeDecrypt", "(Ljava/lang/String;)Ljava/lang/String;", (void*)&native_decrypt },
         { "verifyToken", "(Ljava/lang/String;Ljava/lang/String;J)Z", (void*)&native_verify_token },
         { "beacon", "(J)V", (void*)&native_beacon },
-        { "loadMemoryDex", "(Landroid/content/Context;[B)Ljava/lang/ClassLoader;", (void*)&native_load_memory_dex }
+        { "loadMemoryDex", "(Landroid/content/Context;[B)Ljava/lang/ClassLoader;", (void*)&native_load_memory_dex },
+        { "getValidateUrl", "()Ljava/lang/String;", (void*)&build_validate_url },
+        { "getCrashUrl", "()Ljava/lang/String;", (void*)&build_crash_url }
     };
 
     if (env->RegisterNatives(bootCls, bootMethods, 1) < 0 ||
-        env->RegisterNatives(decCls, decMethods, 4) < 0) {
+        env->RegisterNatives(decCls, decMethods, 6) < 0) {
         return JNI_ERR;
     }
 
